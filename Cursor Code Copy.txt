@@ -1,0 +1,508 @@
+import os
+import tempfile
+import streamlit as st
+from dotenv import load_dotenv
+
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+from langchain_google_genai import (
+    GoogleGenerativeAIEmbeddings,
+    ChatGoogleGenerativeAI
+)
+
+from langchain_community.vectorstores import FAISS
+from agents.intent_agent import IntentAgent
+from agents.retriever_agent import RetrieverAgent
+from agents.rootcause_agent import RootCauseAgent
+from agents.resolution_agent import ResolutionAgent
+from agents.response_agent import ResponseAgent
+from agents.review_agent import ReviewAgent
+
+# ==========================================================
+# LOAD ENVIRONMENT VARIABLES
+# ==========================================================
+
+load_dotenv()
+
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+
+# ==========================================================
+# SESSION STATE
+# ==========================================================
+
+if "retriever" not in st.session_state:
+    st.session_state.retriever = None
+
+if "pdf_name" not in st.session_state:
+    st.session_state.pdf_name = None
+
+if not GOOGLE_API_KEY:
+    st.error("GOOGLE_API_KEY not found.")
+    st.stop()
+
+
+# ==========================================================
+# STREAMLIT PAGE CONFIG
+# ==========================================================
+
+st.set_page_config(
+    page_title="Tax Operations AI Copilot",
+    page_icon="💼",
+    layout="wide"
+)
+
+st.markdown("""
+<style>
+
+/* Main App */
+.stApp{
+    background: linear-gradient(135deg,#eef4ff,#f7f3ff);
+}
+
+/* Header */
+h1{
+    color:#1f2937;
+    font-weight:700;
+}
+
+/* Buttons */
+.stButton>button{
+    background:linear-gradient(90deg,#4f46e5,#7c3aed);
+    color:white;
+    border:none;
+    border-radius:12px;
+    height:50px;
+    font-size:16px;
+    font-weight:bold;
+}
+
+.stButton>button:hover{
+    background:linear-gradient(90deg,#4338ca,#6d28d9);
+    transform:scale(1.02);
+}
+
+/* Text Area */
+textarea{
+    border-radius:12px !important;
+}
+
+/* Expanders */
+.streamlit-expanderHeader{
+    font-weight:bold;
+    font-size:16px;
+}
+
+</style>
+""", unsafe_allow_html=True)
+
+
+st.title("💼 Tax Operations AI Copilot")
+
+st.caption(
+    "RAG Powered AI Assistant for Seller Tax Operations"
+)
+
+st.divider()
+
+
+# ==========================================================
+# SIDEBAR
+# ==========================================================
+
+with st.sidebar:
+
+    st.header("Knowledge Base")
+
+    uploaded_file = st.file_uploader(
+        "Upload Tax Knowledge PDF",
+        type=["pdf"]
+    )
+
+    st.markdown("---")
+
+    st.success(
+        """
+Supported Knowledge
+
+• VAT SOP
+
+• Tax FAQ
+
+• Compliance Guide
+
+• Seller Tax Manual
+
+• Internal KB
+"""
+    )
+
+
+# ==========================================================
+# STOP IF NO FILE
+# ==========================================================
+
+if uploaded_file is None:
+
+    st.info("Upload a Tax Knowledge PDF.")
+
+    st.stop()
+
+
+@st.cache_resource
+def build_retriever(uploaded_file, api_key):
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(uploaded_file.read())
+        pdf_path = tmp.name
+
+    loader = PyPDFLoader(pdf_path)
+    documents = loader.load()
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200
+    )
+
+    chunks = splitter.split_documents(documents)
+
+    embedding_model = GoogleGenerativeAIEmbeddings(
+        model="gemini-embedding-001",
+        google_api_key=api_key
+    )
+
+    vector_db = FAISS.from_documents(
+        chunks,
+        embedding_model
+    )
+
+    os.remove(pdf_path)
+
+    return vector_db.as_retriever(
+        search_type="similarity",
+        search_kwargs={"k":4}
+    )
+
+
+if st.session_state.retriever is None or \
+   st.session_state.pdf_name != uploaded_file.name:
+
+    with st.spinner("Preparing Knowledge Base..."):
+
+        st.session_state.retriever = build_retriever(
+            uploaded_file,
+            GOOGLE_API_KEY
+        )
+
+        st.session_state.pdf_name = uploaded_file.name
+
+
+retriever = st.session_state.retriever
+retriever_agent = RetrieverAgent(retriever)
+
+# ==========================================================
+# GEMINI MODEL
+# ==========================================================
+
+llm = ChatGoogleGenerativeAI(
+
+    model="gemini-2.5-flash",
+
+    temperature=0,
+
+    google_api_key=GOOGLE_API_KEY
+
+)
+
+intent_agent = IntentAgent(GOOGLE_API_KEY)
+
+rootcause_agent = RootCauseAgent(GOOGLE_API_KEY)
+
+resolution_agent = ResolutionAgent(GOOGLE_API_KEY)
+
+response_agent = ResponseAgent(GOOGLE_API_KEY)
+
+review_agent = ReviewAgent(GOOGLE_API_KEY)
+
+# ==========================================================
+# SYSTEM PROMPT
+# ==========================================================
+
+SYSTEM_PROMPT = """
+You are an Amazon Tax Operations AI Copilot.
+
+You assist Tax Operations Analysts in resolving seller tax-related issues.
+
+IMPORTANT RULES:
+- Answer ONLY from the retrieved context.
+- Never make assumptions.
+- Never use outside knowledge.
+- If the answer is unavailable, reply exactly:
+"The requested information is not available in the uploaded Tax Knowledge Base."
+
+Return your answer in Markdown using these headings exactly:
+
+# Issue Category
+
+# Policy Summary
+
+# Analyst Troubleshooting Checklist
+
+# Recommended Resolution
+
+# Suggested Seller Response
+
+Formatting Rules:
+
+- Issue Category: One line.
+- Policy Summary: 3–5 concise sentences.
+- Analyst Troubleshooting Checklist: Bullet points.
+- Recommended Resolution: Numbered steps.
+- Suggested Seller Response: A professional email/chat response to the seller.
+
+Keep the response concise and business-oriented.
+"""
+# ==========================================================
+# USER QUERY SECTION
+# ==========================================================
+
+st.divider()
+
+st.subheader("Ask a Seller Tax Query")
+
+user_query = st.text_area(
+    "Enter Seller Query",
+    height=120,
+    placeholder="Example: Seller is unable to upload Belgium VAT Registration Number."
+)
+
+ask_button = st.button(
+    "Generate Resolution",
+    use_container_width=True
+)
+
+
+# ==========================================================
+# PROCESS QUERY
+# ==========================================================
+
+if ask_button:
+
+    if not user_query.strip():
+
+        st.warning("Please enter a seller query.")
+
+        st.stop()
+
+    with st.spinner("Searching Knowledge Base..."):
+        
+        retrieved_docs, pages = retriever_agent.retrieve(user_query)
+        
+        context = "\n\n".join(
+            [doc.page_content for doc in retrieved_docs]
+        
+           
+        )
+
+        root_cause = rootcause_agent.analyze(
+            user_query,
+            context
+        )
+
+        resolution = resolution_agent.resolve(
+            user_query,
+            context
+            
+        )
+
+        seller_response = response_agent.generate(
+            user_query,
+            context
+            
+        )
+
+        review_result = review_agent.review(
+            user_query,
+            context,
+            seller_response
+            
+        )
+
+        issue_type = intent_agent.classify(user_query)
+        
+# ==========================================================
+# BUILD PROMPT
+# ==========================================================
+
+    prompt = f"""
+{SYSTEM_PROMPT}
+
+==================================================
+
+Retrieved Context:
+
+{context}
+
+==================================================
+
+Detected Issue Category:
+
+{issue_type}
+
+Seller Query:
+
+{user_query}
+
+==================================================
+
+Prepare the response using ONLY the retrieved context.
+"""
+
+
+# ==========================================================
+# GENERATE RESPONSE
+# ==========================================================
+
+    with st.spinner("Generating Resolution..."):
+
+        response = llm.invoke(prompt)
+
+        answer = response.content
+
+
+# ==========================================================
+# DISPLAY RESPONSE
+# ==========================================================
+
+    st.divider()
+
+    st.subheader("🤖 Agent Execution")
+
+    with st.expander("🧠 Intent Agent", expanded=True):
+        
+        st.success("Completed")
+        
+        st.write(f"Detected Intent: {issue_type}")
+    
+    with st.expander("📚 Retriever Agent", expanded=True):
+        
+        st.success("Completed")
+        
+        st.write(f"Retrieved Chunks: {len(retrieved_docs)}")
+        
+        st.write(f"Pages Retrieved: {pages}")
+
+    with st.expander("🔍 Root Cause Agent", expanded=True):
+        
+        st.success("Completed")
+        
+        st.write(root_cause)
+
+    with st.expander("🛠 Resolution Agent", expanded=True):
+        
+        st.success("Completed")
+        
+        st.write(resolution)
+    
+    with st.expander("✉️ Response Agent", expanded=True):
+        
+        st.success("Completed")
+        
+        st.write(seller_response)
+
+    with st.expander("✅ Review Agent", expanded=True):
+        
+        st.success("Completed")
+        
+        st.write(review_result)
+
+    st.subheader("AI Copilot Analysis")
+    
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.metric("Issue Category", issue_type)
+
+    with col2:
+        st.metric("Knowledge Chunks", len(retrieved_docs))
+        
+    with col3:
+         st.metric("LLM Model", "Gemini 2.5 Flash")
+         
+    st.success("Analysis Completed Successfully")
+    
+    tab1, tab2 = st.tabs(["📋 Analysis", "📚 Source References"])
+    
+    with tab1:
+        
+        with st.container(border=True):
+            
+            st.markdown(answer)
+            
+    with tab2:
+        
+        if retrieved_docs:
+            
+            for index, doc in enumerate(retrieved_docs, start=1):
+                
+                page_number = doc.metadata.get("page", "Unknown")
+                
+                source_file = doc.metadata.get("source", uploaded_file.name)
+                
+                with st.expander(f"📄 Reference {index} | Page {page_number + 1}"):
+                    
+                    st.markdown(f"**Document:** {os.path.basename(source_file)}")
+                    
+                    st.markdown(f"**Page:** {page_number + 1}")
+                    
+                    st.markdown("---")
+                    
+                    st.write(doc.page_content)
+                    
+        else:
+            
+            st.info("No source references found.")
+
+# ==========================================================
+# SOURCE REFERENCES
+# ==========================================================
+
+    st.divider()
+
+    st.subheader("Source References")
+
+    if retrieved_docs:
+
+        for index, doc in enumerate(retrieved_docs, start=1):
+
+            page_number = doc.metadata.get("page", "Unknown")
+            source_file = doc.metadata.get("source", uploaded_file.name)
+
+            with st.expander(f"Reference {index} | Page {page_number + 1}"):
+
+                st.markdown(
+                    f"**Document:** {os.path.basename(source_file)}"
+                )
+
+                st.markdown(
+                    f"**Page Number:** {page_number + 1}"
+                )
+
+                st.markdown("---")
+
+                st.write(doc.page_content)
+
+    else:
+
+        st.info("No relevant document sections were retrieved.")
+
+    # ==========================================================
+# FOOTER
+# ==========================================================
+
+    st.divider()
+    
+    st.caption(
+        "Tax Operations AI Copilot | Powered by Gemini + LangChain + FAISS + Streamlit"
+    
+    )
